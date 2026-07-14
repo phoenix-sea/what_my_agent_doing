@@ -64,3 +64,25 @@ claude
 Capture files can contain prompts, completions, tool payloads, account metadata, and
 API credentials. The `logs/` directory is ignored by git, but treat the files as
 sensitive and delete them when you no longer need them.
+
+### Troubleshooting empty logs
+
+When Claude Code reaches the proxy, the proxy prints a line like:
+
+```text
+[1] POST /v1/messages -> started logs/anthropic-proxy/...
+```
+
+If you do not see that line, Claude Code is not using the proxy. Check that
+`ANTHROPIC_BASE_URL` is set in the same shell where you run `claude`, and that the
+URL includes `/v1`.
+
+If you see the `started` line but the response body is incomplete, the Claude Code
+request may still be streaming. The proxy now creates the capture file immediately
+and appends readable response chunks as they arrive.
+
+Completed requests print request, response, duration, and running total stats:
+
+```text
+[1] POST /v1/messages -> 200 duration=4.82 s request=18.6 KiB response=52.1 KiB totals=1 reqs/18.6 KiB in/52.1 KiB out logs/anthropic-proxy/...
+```
