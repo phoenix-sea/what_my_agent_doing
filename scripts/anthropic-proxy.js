@@ -38,30 +38,32 @@ function toRawHeaders(headers) {
     .join("\n");
 }
 
+function isTextBody(headers) {
+  const contentType = String(headers["content-type"] || "");
+  return (
+    contentType.startsWith("text/") ||
+    contentType.includes("json") ||
+    contentType.includes("xml") ||
+    contentType.includes("x-ndjson") ||
+    contentType.includes("event-stream") ||
+    contentType === ""
+  );
+}
+
 function bodyForLog(headers, body) {
   if (body.length === 0) {
     return "";
   }
 
-  const contentType = String(headers["content-type"] || "");
-  const looksText =
-    contentType.startsWith("text/") ||
-    contentType.includes("json") ||
-    contentType.includes("xml") ||
-    contentType.includes("x-ndjson") ||
-    contentType.includes("event-stream");
-
-  if (looksText || contentType === "") {
+  if (isTextBody(headers)) {
     return body.toString("utf8");
   }
 
   return `[base64:${body.toString("base64")}]`;
 }
 
-function writeLogFile(requestId, startedAt, sections) {
-  const logPath = path.join(logDir, `${startedAt}-${String(requestId).padStart(4, "0")}.log`);
-  fs.writeFileSync(logPath, sections.join("\n\n"), "utf8");
-  return logPath;
+function appendLogSection(logPath, title, content) {
+  fs.appendFileSync(logPath, `\n\n## ${title}\n${content}`, "utf8");
 }
 
 function buildUpstreamOptions(req, body) {
@@ -99,11 +101,16 @@ const server = http.createServer(async (req, res) => {
   const requestId = nextRequestId++;
   const startedAt = filenameTimestamp();
   const requestStarted = timestamp();
+  const logPath = path.join(logDir, `${startedAt}-${String(requestId).padStart(4, "0")}.log`);
+
+  fs.writeFileSync(logPath, `# Anthropic proxy capture ${requestId}\n`, "utf8");
+  console.log(`[${requestId}] ${req.method} ${req.url} -> started ${logPath}`);
 
   let body;
   try {
     body = await requestBody(req);
   } catch (error) {
+    appendLogSection(logPath, "Proxy error", `Could not read request body: ${error.stack || error.message}`);
     res.writeHead(400, { "content-type": "text/plain" });
     res.end(`Could not read request body: ${error.message}\n`);
     return;
@@ -112,20 +119,34 @@ const server = http.createServer(async (req, res) => {
   const upstreamOptions = buildUpstreamOptions(req, body);
   const upstreamStarted = timestamp();
 
-  const sections = [
-    `# Anthropic proxy capture ${requestId}`,
-    `## Client request\n${req.method} ${req.url} HTTP/${req.httpVersion}\n${toRawHeaders(req.headers)}\n\n${bodyForLog(req.headers, body)}`,
-    `## Upstream request\n${req.method} ${upstreamOptions.protocol}//${upstreamOptions.hostname}${upstreamOptions.path}\n${toRawHeaders(upstreamOptions.headers)}\n\n${bodyForLog(upstreamOptions.headers, body)}`,
-  ];
+  appendLogSection(
+    logPath,
+    "Client request",
+    `${req.method} ${req.url} HTTP/${req.httpVersion}\n${toRawHeaders(req.headers)}\n\n${bodyForLog(req.headers, body)}`,
+  );
+  appendLogSection(
+    logPath,
+    "Upstream request",
+    `${req.method} ${upstreamOptions.protocol}//${upstreamOptions.hostname}${upstreamOptions.path}\n${toRawHeaders(upstreamOptions.headers)}\n\n${bodyForLog(upstreamOptions.headers, body)}`,
+  );
 
   const transport = targetOrigin.protocol === "http:" ? http : https;
   const upstreamReq = transport.request(upstreamOptions, (upstreamRes) => {
     const responseChunks = [];
+    const liveLogResponse = isTextBody(upstreamRes.headers);
 
     res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+    appendLogSection(
+      logPath,
+      "Upstream response",
+      `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\n${toRawHeaders(upstreamRes.headers)}\n`,
+    );
 
     upstreamRes.on("data", (chunk) => {
       responseChunks.push(chunk);
+      if (liveLogResponse) {
+        fs.appendFileSync(logPath, chunk.toString("utf8"), "utf8");
+      }
       res.write(chunk);
     });
 
@@ -133,19 +154,25 @@ const server = http.createServer(async (req, res) => {
       res.end();
 
       const responseBody = Buffer.concat(responseChunks);
-      sections.push(
-        `## Upstream response\nHTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\n${toRawHeaders(upstreamRes.headers)}\n\n${bodyForLog(upstreamRes.headers, responseBody)}`,
-        `## Timing\nclient_request_started: ${requestStarted}\nupstream_request_started: ${upstreamStarted}\nresponse_finished: ${timestamp()}`,
+      if (!liveLogResponse) {
+        fs.appendFileSync(logPath, `\n${bodyForLog(upstreamRes.headers, responseBody)}`, "utf8");
+      }
+      appendLogSection(
+        logPath,
+        "Timing",
+        `client_request_started: ${requestStarted}\nupstream_request_started: ${upstreamStarted}\nresponse_finished: ${timestamp()}`,
       );
-
-      const logPath = writeLogFile(requestId, startedAt, sections);
       console.log(`[${requestId}] ${req.method} ${req.url} -> ${upstreamRes.statusCode} ${logPath}`);
+    });
+
+    upstreamRes.on("aborted", () => {
+      appendLogSection(logPath, "Proxy error", `upstream response aborted: ${timestamp()}`);
+      console.error(`[${requestId}] upstream response aborted ${logPath}`);
     });
   });
 
   upstreamReq.on("error", (error) => {
-    sections.push(`## Proxy error\n${error.stack || error.message}`);
-    const logPath = writeLogFile(requestId, startedAt, sections);
+    appendLogSection(logPath, "Proxy error", error.stack || error.message);
     console.error(`[${requestId}] upstream error: ${error.message} ${logPath}`);
 
     if (!res.headersSent) {
