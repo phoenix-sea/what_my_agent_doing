@@ -15,6 +15,11 @@ const preserveAcceptEncoding = process.env.PRESERVE_ACCEPT_ENCODING === "1";
 fs.mkdirSync(logDir, { recursive: true });
 
 let nextRequestId = 1;
+const totals = {
+  requests: 0,
+  requestBytes: 0,
+  responseBytes: 0,
+};
 
 function timestamp() {
   return new Date().toISOString();
@@ -66,6 +71,46 @@ function appendLogSection(logPath, title, content) {
   fs.appendFileSync(logPath, `\n\n## ${title}\n${content}`, "utf8");
 }
 
+function formatBytes(bytes) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const units = ["KiB", "MiB", "GiB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+function formatDurationMs(startedAtMs) {
+  const durationMs = Date.now() - startedAtMs;
+  if (durationMs < 1000) {
+    return `${durationMs} ms`;
+  }
+
+  return `${(durationMs / 1000).toFixed(2)} s`;
+}
+
+function printRequestStats(requestId, req, statusCode, requestBytes, responseBytes, startedAtMs, logPath) {
+  totals.requests++;
+  totals.requestBytes += requestBytes;
+  totals.responseBytes += responseBytes;
+
+  console.log(
+    `[${requestId}] ${req.method} ${req.url} -> ${statusCode} ` +
+      `duration=${formatDurationMs(startedAtMs)} ` +
+      `request=${formatBytes(requestBytes)} response=${formatBytes(responseBytes)} ` +
+      `totals=${totals.requests} reqs/${formatBytes(totals.requestBytes)} in/${formatBytes(totals.responseBytes)} out ` +
+      logPath,
+  );
+}
+
 function buildUpstreamOptions(req, body) {
   const upstreamHeaders = { ...req.headers };
   upstreamHeaders.host = targetOrigin.host;
@@ -100,6 +145,7 @@ function requestBody(req) {
 const server = http.createServer(async (req, res) => {
   const requestId = nextRequestId++;
   const startedAt = filenameTimestamp();
+  const startedAtMs = Date.now();
   const requestStarted = timestamp();
   const logPath = path.join(logDir, `${startedAt}-${String(requestId).padStart(4, "0")}.log`);
 
@@ -107,10 +153,13 @@ const server = http.createServer(async (req, res) => {
   console.log(`[${requestId}] ${req.method} ${req.url} -> started ${logPath}`);
 
   let body;
+  let requestBytes = 0;
   try {
     body = await requestBody(req);
+    requestBytes = body.length;
   } catch (error) {
     appendLogSection(logPath, "Proxy error", `Could not read request body: ${error.stack || error.message}`);
+    printRequestStats(requestId, req, "BAD_REQUEST", requestBytes, 0, startedAtMs, logPath);
     res.writeHead(400, { "content-type": "text/plain" });
     res.end(`Could not read request body: ${error.message}\n`);
     return;
@@ -118,6 +167,9 @@ const server = http.createServer(async (req, res) => {
 
   const upstreamOptions = buildUpstreamOptions(req, body);
   const upstreamStarted = timestamp();
+  let requestReported = false;
+
+  console.log(`[${requestId}] request body=${formatBytes(requestBytes)}`);
 
   appendLogSection(
     logPath,
@@ -162,18 +214,36 @@ const server = http.createServer(async (req, res) => {
         "Timing",
         `client_request_started: ${requestStarted}\nupstream_request_started: ${upstreamStarted}\nresponse_finished: ${timestamp()}`,
       );
-      console.log(`[${requestId}] ${req.method} ${req.url} -> ${upstreamRes.statusCode} ${logPath}`);
+      printRequestStats(
+        requestId,
+        req,
+        upstreamRes.statusCode,
+        requestBytes,
+        responseBody.length,
+        startedAtMs,
+        logPath,
+      );
+      requestReported = true;
     });
 
     upstreamRes.on("aborted", () => {
+      const responseBody = Buffer.concat(responseChunks);
       appendLogSection(logPath, "Proxy error", `upstream response aborted: ${timestamp()}`);
       console.error(`[${requestId}] upstream response aborted ${logPath}`);
+      if (!requestReported) {
+        printRequestStats(requestId, req, "ABORTED", requestBytes, responseBody.length, startedAtMs, logPath);
+        requestReported = true;
+      }
     });
   });
 
   upstreamReq.on("error", (error) => {
     appendLogSection(logPath, "Proxy error", error.stack || error.message);
     console.error(`[${requestId}] upstream error: ${error.message} ${logPath}`);
+    if (!requestReported) {
+      printRequestStats(requestId, req, "UPSTREAM_ERROR", requestBytes, 0, startedAtMs, logPath);
+      requestReported = true;
+    }
 
     if (!res.headersSent) {
       res.writeHead(502, { "content-type": "text/plain" });
